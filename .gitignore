@@ -26,3 +26,6 @@ Icon?
 #HenonMap/data_pub/rTipPara*
 HenonMap/data_pub/rTipPara_ai0.200bi0.250.csv
 HenonMap/data_pub/rTipParaReverse_af1.380bf-0.540.csv
+
+## Python
+__pycache__/
