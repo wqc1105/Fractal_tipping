@@ -590,20 +590,22 @@ def visualise_first_fractal_parallel(
         delayed(_keep)(pt) for pt in grid
     )
     keep_mask = np.asarray(keep_mask, dtype=bool)
-    pts = grid[keep_mask]
-
     if not inplace:
         plt.figure(figsize=(5, 1.7), dpi=600)
 
     ax = plt.gca()
     right_reinject, _ = modified_tent_intersections(**kwargs)
-    ax.axvspan(xmin=xmin, xmax=right_reinject, facecolor="yellow")
 
-    if pts.size > 0:
-        plt.hist(pts, bins=len(pts), color="blue", label="Fractal set")
-    else:
-        # still draw an empty plot gracefully
-        plt.hist([], bins=1, color="blue", label="Fractal set")
+    state_img = np.zeros((32, npts, 3), dtype=float)
+    state_img[:, keep_mask] = [0.0, 0.0, 1.0]
+    state_img[:, ~keep_mask] = [1.0, 1.0, 0.0]
+    ax.imshow(
+        state_img,
+        origin="lower",
+        extent=[xmin, xmax, 0, 1],
+        aspect="auto",
+        interpolation="nearest",
+    )
 
     plt.xlabel("$x$")
     plt.axvline(0, color='black', linestyle='--', linewidth=1)
@@ -843,15 +845,16 @@ def visualise_second_fractal_parallel(
 
     plt.figure(figsize=(6, 1), dpi=600)
 
-    if tracking_ds.size > 0:
-        plt.hist(tracking_ds, bins=len(tracking_ds), color="blue", label="Tracking")
-    else:
-        plt.hist([], bins=1, color="blue", label="Tracking")
-
-    if escaping_ds.size > 0:
-        plt.hist(escaping_ds, bins=len(escaping_ds), color="yellow", label="Escaping")
-    else:
-        plt.hist([], bins=1, color="yellow", label="Escaping")
+    state_img = np.zeros((1, npts, 3), dtype=float)
+    state_img[0, tracking_mask] = [0.0, 0.0, 1.0]
+    state_img[0, ~tracking_mask] = [1.0, 1.0, 0.0]
+    plt.imshow(
+        state_img,
+        origin="lower",
+        extent=[d_low, d_high, 0, 1],
+        aspect="auto",
+        interpolation="nearest",
+    )
 
     if (func == modified_tent and mark_symbol):
         right_reinject, attractor = modified_tent_intersections(d=0, **kwargs)
@@ -999,15 +1002,16 @@ def visualise_third_fractal_parallel(
 
     plt.figure(figsize=(5, 1.7), dpi=600)
 
-    if tracking_rates.size > 0:
-        plt.hist(tracking_rates, bins=len(tracking_rates), color="blue", label="Tracking")
-    else:
-        plt.hist([], bins=1, color="blue", label="Tracking")
-
-    if escaping_rates.size > 0:
-        plt.hist(escaping_rates, bins=len(escaping_rates), color="yellow", label="Escaping")
-    else:
-        plt.hist([], bins=1, color="yellow", label="Escaping")
+    state_img = np.zeros((1, npts, 3), dtype=float)
+    state_img[0, tracking_mask] = [0.0, 0.0, 1.0]
+    state_img[0, ~tracking_mask] = [1.0, 1.0, 0.0]
+    plt.imshow(
+        state_img,
+        origin="lower",
+        extent=[rate_lower_bound, rate_upper_bound, 0, 1],
+        aspect="auto",
+        interpolation="nearest",
+    )
 
     plt.ylim([0, 1])
     plt.yticks([])

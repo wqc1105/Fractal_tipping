@@ -374,7 +374,7 @@ def visualise_basin_cut_numba(
     fig_size = (5,1.5)
 ):
     """
-    Computes a 1D cut mask and plots a histogram of initial conditions
+    Computes a 1D cut mask and plots a 1D state image of initial conditions
     that are periodic (mask==1).
     """
 
@@ -398,17 +398,21 @@ def visualise_basin_cut_numba(
         v_cut, v_value, theta_value
     )
 
-    tracked = x_vals[mask_1d == 1]
-    tipped = x_vals[mask_1d == 0]
-
     fontsize = 14
 
-    # Histogram
     plt.figure(figsize=(fig_size[0],fig_size[1]), dpi=dpi)
-    if tracked.size > 0:
-        plt.hist(tracked, bins=len(tracked), color="blue", label="Tracking")
-    if tipped.size > 0:
-        plt.hist(tipped, bins=len(tipped), color="yellow", label="Escaping")
+    state_img = np.zeros((32, npts, 3), dtype=float)
+    tracked_mask = mask_1d == 1
+    state_img[:, tracked_mask] = [0.0, 0.0, 1.0]
+    state_img[:, ~tracked_mask] = [1.0, 1.0, 0.0]
+    plt.imshow(
+        state_img,
+        origin='lower',
+        extent=[min_val, max_val, 0, 1],
+        cmap=None,
+        aspect='auto',
+        interpolation='nearest'
+    )
 
     plt.ylim([0, 1])
     plt.xlabel(xlabel, fontsize=fontsize)
@@ -461,89 +465,173 @@ def bootstrapping_slope_confid_interval(slope, log_eps, log_feps, boot_size, rep
     confid_int = max(upper - slope, slope - lower)
     return confid_int
 
+@njit(parallel=True)
+def uncertainty_periodicity_scan_numba(theta_vals, v_vals, dt, n_steps, trunc_start,
+                                       pi_fraction, omega, nu, f, tol):
+    """
+    For each initial condition in the input arrays, integrate the pendulum
+    and test 2pi-periodicity in parallel.
+    Returns mask[k] = 1 if periodic, 0 otherwise.
+    """
+    n = theta_vals.size
+    mask = np.zeros(n, dtype=np.uint8)
+
+    for k in prange(n):
+        thetas, _ = solve_pendulum_numba(
+            theta_vals[k], v_vals[k], dt, n_steps, nu, omega, f, 0.0
+        )
+        th_tail = thetas[trunc_start:]
+
+        if is_periodic_numba(
+            pi_fraction=pi_fraction,
+            thetas=th_tail,
+            omega=omega,
+            tolerance=tol
+        ):
+            mask[k] = 1
+
+    return mask
+
+def _update_uncertainty_counts(trials, uncertains, pair_diffs, threshold):
+    """
+    Update the counts exactly, including the case where the threshold is
+    crossed partway through the current batch.
+    """
+    remaining = threshold - uncertains
+    cumulative_hits = np.cumsum(pair_diffs.astype(np.int64))
+
+    if cumulative_hits[-1] < remaining:
+        return trials + pair_diffs.size, uncertains + int(cumulative_hits[-1])
+
+    hit_index = int(np.searchsorted(cumulative_hits, remaining, side='left'))
+    return trials + hit_index + 1, threshold
+
 def _uncertainty_for_eps(eps, threshold, theta_min, theta_max, vmin, vmax,
-                         f, omega, nu, tol, divisor=200):
+                         f, omega, nu, tol, divisor=200, batch_size=1024,
+                         rng=None, t_max=500.0, truncating_factor=0.9,
+                         max_trials=1_000_000):
     """
-    Worker for the uncertainty algorithm in the phase space.
+    Batched worker for the uncertainty algorithm in the phase space.
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dt = np.pi / divisor
+    n_steps = int(t_max / dt)
+    trunc_start = int(truncating_factor * n_steps)
+
     trials = 0
     uncertains = 0
+    sampled_pairs = 0
+
+    theta_batch = np.empty(batch_size * 2, dtype=np.float64)
+    v_batch = np.empty(batch_size * 2, dtype=np.float64)
 
     while uncertains < threshold:
-        trials += 1
-        theta1 = np.random.uniform(theta_min, theta_max)
-        v1     = np.random.uniform(vmin, vmax)
-        angle  = np.random.uniform(0, 2*np.pi)
+        theta1s = rng.uniform(theta_min, theta_max, batch_size)
+        v1s = rng.uniform(vmin, vmax, batch_size)
+        angles = rng.uniform(0.0, 2.0 * np.pi, batch_size)
 
-        theta2 = theta1 + eps * np.cos(angle)
-        v2     = v1     + eps * np.sin(angle)
+        dthetas = eps * np.cos(angles)
+        dvs = eps * np.sin(angles)
 
-        _, thetas1 = get_stroboscopic_trajectory(
-            ini_condition=[theta1, v1],
-            omega=omega, nu=nu, f=f, plot=False, divisor=divisor
+        theta2s = theta1s + dthetas
+        v2s = v1s + dvs
+
+        out_of_bounds = (
+            (theta2s < theta_min) | (theta2s > theta_max) |
+            (v2s < vmin) | (v2s > vmax)
         )
-        isperiodic1 = abs(thetas1[-1] - thetas1[-2]) < tol
+        theta2s[out_of_bounds] = theta1s[out_of_bounds] - dthetas[out_of_bounds]
+        v2s[out_of_bounds] = v1s[out_of_bounds] - dvs[out_of_bounds]
 
-        _, thetas2 = get_stroboscopic_trajectory(
-            ini_condition=[theta2, v2],
-            omega=omega, nu=nu, f=f, plot=False, divisor=divisor
+        theta2s = np.clip(theta2s, theta_min, theta_max)
+        v2s = np.clip(v2s, vmin, vmax)
+
+        theta_batch[:batch_size] = theta1s
+        theta_batch[batch_size:] = theta2s
+        v_batch[:batch_size] = v1s
+        v_batch[batch_size:] = v2s
+
+        periodic_mask = uncertainty_periodicity_scan_numba(
+            theta_batch, v_batch, dt, n_steps, trunc_start,
+            divisor, omega, nu, f, tol
         )
-        isperiodic2 = abs(thetas2[-1] - thetas2[-2]) < tol
+        pair_diffs = periodic_mask[:batch_size] != periodic_mask[batch_size:]
+        trials, uncertains = _update_uncertainty_counts(
+            trials, uncertains, pair_diffs, threshold
+        )
 
-        if (isperiodic1 and not isperiodic2) or (not isperiodic1 and isperiodic2):
-            uncertains += 1
+        sampled_pairs += batch_size
+        if sampled_pairs >= max_trials and uncertains == 0:
+            raise ValueError(
+                f'No uncertain points found after {sampled_pairs} sampled pairs at eps={eps:.3e}. '
+                'The sampled region may lie inside a single basin at this scale.'
+            )
 
     p_hat = threshold / trials
     sigma_p = p_hat * np.sqrt(max(0.0, (1.0 - p_hat)) / threshold)
     return p_hat, sigma_p, trials
 
 def _uncertainty_for_eps_1D(eps, threshold, theta_min, theta_max, vmin, vmax,
-                         f, omega, nu, tol, fix_v, theta, v, divisor):
+                            f, omega, nu, tol, fix_v, theta, v, divisor=200,
+                            batch_size=1024, rng=None, t_max=500.0,
+                            truncating_factor=0.9, max_trials=1_000_000):
     """
-    Worker for the uncertainty algorithm in the phase space. Only select initial conditions
-    along a horizontal/vertical line as an approximation to the uncertainty algorithm.
+    Batched worker for the 1D uncertainty algorithm in the phase space.
     If fix_v=True:  select random theta in [theta_min, theta_max), v0 = v.
     If fix_v=False: select random v in [v_min, v_max), theta0 = theta.
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dt = np.pi / divisor
+    n_steps = int(t_max / dt)
+    trunc_start = int(truncating_factor * n_steps)
+
     trials = 0
     uncertains = 0
+    sampled_pairs = 0
+
+    theta_batch = np.empty(batch_size * 2, dtype=np.float64)
+    v_batch = np.empty(batch_size * 2, dtype=np.float64)
 
     while uncertains < threshold:
-        trials += 1
+        if fix_v:
+            theta1s = rng.uniform(theta_min, theta_max, batch_size)
+            theta2s = np.where(theta1s + eps <= theta_max, theta1s + eps, theta1s - eps)
+            theta2s = np.clip(theta2s, theta_min, theta_max)
 
-        if (fix_v):
-            theta1 = np.random.uniform(theta_min, theta_max)
-            theta2 = theta1 + eps if theta1 + eps < theta_max else theta1 - eps
-
-            _, thetas1 = get_stroboscopic_trajectory(
-                ini_condition=[theta1, v],
-                omega=omega, nu=nu, f=f, plot=False, divisor=divisor
-            )
-            isperiodic1 = abs(thetas1[-1] - thetas1[-2]) < tol
-
-            _, thetas2 = get_stroboscopic_trajectory(
-                ini_condition=[theta2, v],
-                omega=omega, nu=nu, f=f, plot=False, divisor=divisor
-            )
+            v1s = np.full(batch_size, v, dtype=np.float64)
+            v2s = v1s.copy()
         else:
-            v1 = np.random.uniform(vmin, vmax)
-            v2 = v1 + eps if v1 + eps < vmax else v1 - eps
+            v1s = rng.uniform(vmin, vmax, batch_size)
+            v2s = np.where(v1s + eps <= vmax, v1s + eps, v1s - eps)
+            v2s = np.clip(v2s, vmin, vmax)
 
-            _, thetas1 = get_stroboscopic_trajectory(
-                ini_condition=[theta, v1],
-                omega=omega, nu=nu, f=f, plot=False, divisor=divisor
+            theta1s = np.full(batch_size, theta, dtype=np.float64)
+            theta2s = theta1s.copy()
+
+        theta_batch[:batch_size] = theta1s
+        theta_batch[batch_size:] = theta2s
+        v_batch[:batch_size] = v1s
+        v_batch[batch_size:] = v2s
+
+        periodic_mask = uncertainty_periodicity_scan_numba(
+            theta_batch, v_batch, dt, n_steps, trunc_start,
+            divisor, omega, nu, f, tol
+        )
+        pair_diffs = periodic_mask[:batch_size] != periodic_mask[batch_size:]
+        trials, uncertains = _update_uncertainty_counts(
+            trials, uncertains, pair_diffs, threshold
+        )
+
+        sampled_pairs += batch_size
+        if sampled_pairs >= max_trials and uncertains == 0:
+            raise ValueError(
+                f'No uncertain points found after {sampled_pairs} sampled pairs at eps={eps:.3e}. '
+                'This 1D cut may stay inside a single basin at this scale.'
             )
-            isperiodic1 = abs(thetas1[-1] - thetas1[-2]) < tol
-
-            _, thetas2 = get_stroboscopic_trajectory(
-                ini_condition=[theta, v2],
-                omega=omega, nu=nu, f=f, plot=False, divisor=divisor
-            )
-
-        isperiodic2 = abs(thetas2[-1] - thetas2[-2]) < tol
-
-        if (isperiodic1 and not isperiodic2) or (not isperiodic1 and isperiodic2):
-            uncertains += 1
 
     p_hat = threshold / trials
     sigma_p = p_hat * np.sqrt(max(0.0, (1.0 - p_hat)) / threshold)
@@ -615,63 +703,67 @@ def loglog_linear_fit(
     else:
         return slope
 
-
 def uncertainty_algorithm(theta_min=-np.pi, theta_max=np.pi,
                           vmin=-3, vmax=3, threshold=1000, plot=True,
                           verbose=True, min_eps=1e-10, max_eps=1e-6, num_eps=20,
                           return_all_info=False, f=1.2, omega=1, nu=0.1, tol=1e-3,
-                          n_jobs=1, fit_truncation_order = 0, divisor = 200, **kwargs):
+                          n_jobs=1, fit_truncation_order = 0, divisor = 200,
+                          batch_size=1024, t_max=500.0, truncating_factor=0.9,
+                          base_seed=0, max_trials=1_000_000, **kwargs):
 
     '''
     Wrapper for the uncertainty algorithm in the phase space.
+    Uses batched initial conditions and a vectorised periodicity scan.
     '''
 
     epsilons = np.geomspace(min_eps, max_eps, num_eps)
-
-    # Choose iterator for outer loop (for nice progress display)
-    if verbose and n_jobs == 1:
-        iterator = tqdm(epsilons, desc="ε sweep")
-    else:
-        iterator = epsilons
-
     feps = []
     feps_err = []
-    trials_list = []
 
-    if n_jobs == 1:
-        # ---- Serial version  ----
-        for eps in iterator:
-            p_hat, sigma_p, trials = _uncertainty_for_eps(
-                eps, threshold,
-                theta_min, theta_max, vmin, vmax,
-                f, omega, nu, tol, divisor
-            )
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
-    else:
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(_uncertainty_for_eps)(
-                eps, threshold,
-                theta_min, theta_max, vmin, vmax,
-                f, omega, nu, tol, divisor
-            )
-            for eps in epsilons
+    if verbose:
+        print(
+            f"Running uncertainty algorithm with batch_size={batch_size} "
+            f"(n_jobs={n_jobs}, divisor={divisor})..."
         )
+        iterator = tqdm(
+            enumerate(epsilons),
+            total=len(epsilons),
+            desc="Sweeping the phase space: "
+        )
+    else:
+        iterator = enumerate(epsilons)
 
-        for p_hat, sigma_p, trials in results:
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
+    for i, eps in iterator:
+        rng = np.random.default_rng(base_seed + i)
+        p_hat, sigma_p, _ = _uncertainty_for_eps(
+            eps=eps,
+            threshold=threshold,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            vmin=vmin,
+            vmax=vmax,
+            f=f,
+            omega=omega,
+            nu=nu,
+            tol=tol,
+            divisor=divisor,
+            batch_size=batch_size,
+            rng=rng,
+            t_max=t_max,
+            truncating_factor=truncating_factor,
+            max_trials=max_trials
+        )
+        feps.append(p_hat)
+        feps_err.append(sigma_p)
 
     return loglog_linear_fit(
-    epsilons,
-    feps,
-    feps_err=feps_err,
-    fit_truncation_order=fit_truncation_order,
-    plot=plot,
-    title='f(ε) vs ε for the first fractal',
-    return_all_info=return_all_info,
+        epsilons,
+        feps,
+        feps_err=feps_err,
+        fit_truncation_order=fit_truncation_order,
+        plot=plot,
+        title='f(蔚) vs 蔚 for the first fractal',
+        return_all_info=return_all_info,
     )
 
 def uncertainty_algorithm_1D(theta_min=-np.pi, theta_max=np.pi,
@@ -679,60 +771,70 @@ def uncertainty_algorithm_1D(theta_min=-np.pi, theta_max=np.pi,
                           verbose=True, min_eps=1e-10, max_eps=1e-6, num_eps=20,
                           return_all_info=False, f=1.2, omega=1, nu=0.1, tol=1e-3,
                           n_jobs=1, fix_v = True, theta = 0, v = 0, fit_truncation_order = 0,
-                          divisor = 200, **kwargs):
+                          divisor = 200, batch_size=1024, t_max=500.0,
+                          truncating_factor=0.9, base_seed=0,
+                          max_trials=1_000_000, **kwargs):
 
     '''
     Wrapper for the 1D uncertainty algorithm in the phase space.
+    Uses batched initial conditions and a vectorised periodicity scan.
     '''
 
     epsilons = np.geomspace(min_eps, max_eps, num_eps)
-
-    if verbose and n_jobs == 1:
-        iterator = tqdm(epsilons, desc="ε sweep")
-    else:
-        iterator = epsilons
-
     feps = []
     feps_err = []
-    trials_list = []
+    cut_direction = 'theta' if fix_v else 'v'
 
-    if n_jobs == 1:
-        # ---- Serial version ----
-        for eps in iterator:
-            p_hat, sigma_p, trials = _uncertainty_for_eps_1D(
-                eps, threshold,
-                theta_min, theta_max, vmin, vmax,
-                f, omega, nu, tol, fix_v, theta, v, divisor
-            )
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
-    else:
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(_uncertainty_for_eps_1D)(
-                eps, threshold,
-                theta_min, theta_max, vmin, vmax,
-                f, omega, nu, tol, fix_v, theta, v, divisor
-            )
-            for eps in epsilons
+    if verbose:
+        print(
+            f"Running 1D uncertainty algorithm with batch_size={batch_size}, "
+            f"cut_direction={cut_direction} (n_jobs={n_jobs}, divisor={divisor})..."
         )
+        iterator = tqdm(
+            enumerate(epsilons),
+            total=len(epsilons),
+            desc=f"{cut_direction}-cut sweep"
+        )
+    else:
+        iterator = enumerate(epsilons)
 
-        for p_hat, sigma_p, trials in results:
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
+    for i, eps in iterator:
+        rng = np.random.default_rng(base_seed + i)
+        p_hat, sigma_p, _ = _uncertainty_for_eps_1D(
+            eps=eps,
+            threshold=threshold,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            vmin=vmin,
+            vmax=vmax,
+            f=f,
+            omega=omega,
+            nu=nu,
+            tol=tol,
+            fix_v=fix_v,
+            theta=theta,
+            v=v,
+            divisor=divisor,
+            batch_size=batch_size,
+            rng=rng,
+            t_max=t_max,
+            truncating_factor=truncating_factor,
+            max_trials=max_trials
+        )
+        feps.append(p_hat)
+        feps_err.append(sigma_p)
 
     feps = np.asarray(feps)
     feps_err = np.asarray(feps_err)
 
     return loglog_linear_fit(
-    epsilons,
-    feps,
-    feps_err=feps_err,
-    fit_truncation_order=fit_truncation_order,
-    plot=plot,
-    title='f(ε) vs ε for the first fractal',
-    return_all_info=return_all_info,
+        epsilons,
+        feps,
+        feps_err=feps_err,
+        fit_truncation_order=fit_truncation_order,
+        plot=plot,
+        title='f(ε) vs ε for the first fractal',
+        return_all_info=return_all_info,
     )
 
 def alpha_vs_F(fmin = 0.9, fmax = 1.5, npts = 10, **kwargs):
@@ -990,18 +1092,22 @@ def visualise_vertical_cut(
         tolerance=tol
     )
 
-    periodic_fs = fs[mask == 1]
-    non_periodic_fs = fs[mask == 0]
-
-    # --- 4. plot histogram ---
     plt.figure(figsize=(fig_size[0], fig_size[1]), dpi = dpi)
 
     fontsize = 14
 
-    if periodic_fs.size > 0:
-        plt.hist(periodic_fs, bins=len(periodic_fs), color="blue", label="Tracking")
-    if non_periodic_fs.size > 0:
-        plt.hist(non_periodic_fs, bins=len(non_periodic_fs), color="yellow", label="Escaping")
+    state_img = np.zeros((32, npts, 3), dtype=float)
+    periodic_mask = mask == 1
+    state_img[:, periodic_mask] = [0.0, 0.0, 1.0]
+    state_img[:, ~periodic_mask] = [1.0, 1.0, 0.0]
+    plt.imshow(
+        state_img,
+        origin='lower',
+        extent=[fmin, fmax, 0, 1],
+        cmap=None,
+        aspect='auto',
+        interpolation='nearest'
+    )
 
     plt.ylim([0, 1])
     plt.xlabel("$\lambda_+$", fontsize=fontsize)
@@ -1020,32 +1126,53 @@ def visualise_vertical_cut(
 # 2.
 ##############################################################
 
-def _uncertainty_for_eps_F(eps, threshold, theta0, v0, fmin, fmax, omega, nu, tol):
+def _uncertainty_for_eps_F(eps, threshold, theta0, v0, fmin, fmax, omega, nu, tol,
+                           divisor=200, batch_size=1024, rng=None, t_max=500.0,
+                           max_trials=1_000_000):
     """
-    Worker for the uncertainty algorithm of the second fractal
+    Batched worker for the uncertainty algorithm of the second fractal.
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    dt = np.pi / divisor
+    n_steps = int(t_max / dt)
+
     trials = 0
     uncertains = 0
+    sampled_pairs = 0
+    fs = np.empty(batch_size * 2, dtype=np.float64)
 
     while uncertains < threshold:
-        trials += 1
-        f1 = np.random.uniform(fmin, fmax)
-        f2 = f1 + eps if f1 + eps < fmax else f1 - eps
+        f1s = rng.uniform(fmin, fmax, batch_size)
+        f2s = np.where(f1s + eps <= fmax, f1s + eps, f1s - eps)
+        f2s = np.clip(f2s, fmin, fmax)
 
-        _, thetas1 = get_stroboscopic_trajectory(
-            ini_condition=[theta0, v0],
-            omega=omega, nu=nu, f=f1, plot=False
+        fs[:batch_size] = f1s
+        fs[batch_size:] = f2s
+
+        periodic_mask = vertical_cut_scan_numba(
+            theta0=theta0,
+            v0=v0,
+            fs=fs,
+            dt=dt,
+            n_steps=n_steps,
+            nu=nu,
+            omega=omega,
+            pi_fraction=divisor,
+            tolerance=tol
         )
-        isperiodic1 = abs(thetas1[-1] - thetas1[-2]) < tol
-
-        _, thetas2 = get_stroboscopic_trajectory(
-            ini_condition=[theta0, v0],
-            omega=omega, nu=nu, f=f2, plot=False
+        pair_diffs = periodic_mask[:batch_size] != periodic_mask[batch_size:]
+        trials, uncertains = _update_uncertainty_counts(
+            trials, uncertains, pair_diffs, threshold
         )
-        isperiodic2 = abs(thetas2[-1] - thetas2[-2]) < tol
 
-        if (isperiodic1 and not isperiodic2) or (not isperiodic1 and isperiodic2):
-            uncertains += 1
+        sampled_pairs += batch_size
+        if sampled_pairs >= max_trials and uncertains == 0:
+            raise ValueError(
+                f'No uncertain points found after {sampled_pairs} sampled pairs at eps={eps:.3e}. '
+                'The sampled forcing interval may lie inside a single basin at this scale.'
+            )
 
     p_hat = threshold / trials
     sigma_p = p_hat * np.sqrt(max(0.0, (1.0 - p_hat)) / threshold)
@@ -1054,50 +1181,61 @@ def _uncertainty_for_eps_F(eps, threshold, theta0, v0, fmin, fmax, omega, nu, to
 def uncertainty_algorithm_F(theta0, v0, fmin = 0, fmax = 1.8, threshold=1000, plot=True,
                           verbose=True, min_eps=1e-10, max_eps=1e-6, num_eps=20,
                           return_all_info=False, f=1.2, omega=1, nu=0.1, tol=1e-3,
-                          n_jobs=1, fit_truncation_order = 0, **kwargs):
+                          n_jobs=1, fit_truncation_order = 0, divisor=200,
+                          batch_size=1024, t_max=500.0, base_seed=0,
+                          max_trials=1_000_000, **kwargs):
 
     '''
     Implement the uncertainty algorithm for the second fractal.
+    Uses batched forcing values and a vectorised periodicity scan.
     '''
 
     epsilons = np.geomspace(min_eps, max_eps, num_eps)
-
-    if verbose and n_jobs == 1:
-        iterator = tqdm(epsilons, desc="ε sweep")
-    else:
-        iterator = epsilons
-
     feps = []
     feps_err = []
-    trials_list = []
 
-    if n_jobs == 1:
-        # ---- Serial version (as before) ----
-        for eps in iterator:
-            p_hat, sigma_p, trials = _uncertainty_for_eps_F(
-            eps, threshold, theta0, v0, fmin, fmax, omega, nu, tol)
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
+    if verbose:
+        print(
+            f"Running second-fractal uncertainty algorithm with batch_size={batch_size} "
+            f"(divisor={divisor})..."
+        )
+        iterator = tqdm(
+            enumerate(epsilons),
+            total=len(epsilons),
+            desc="fractal-2 eps sweep"
+        )
     else:
-        results = Parallel(n_jobs=n_jobs)(
-                delayed(_uncertainty_for_eps_F)(eps, threshold, theta0, v0, fmin, fmax, omega, nu, tol)
-                for eps in epsilons
-            )
+        iterator = enumerate(epsilons)
 
-        for p_hat, sigma_p, trials in results:
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
+    for i, eps in iterator:
+        rng = np.random.default_rng(base_seed + i)
+        p_hat, sigma_p, _ = _uncertainty_for_eps_F(
+            eps=eps,
+            threshold=threshold,
+            theta0=theta0,
+            v0=v0,
+            fmin=fmin,
+            fmax=fmax,
+            omega=omega,
+            nu=nu,
+            tol=tol,
+            divisor=divisor,
+            batch_size=batch_size,
+            rng=rng,
+            t_max=t_max,
+            max_trials=max_trials
+        )
+        feps.append(p_hat)
+        feps_err.append(sigma_p)
 
     return loglog_linear_fit(
-    epsilons,
-    feps,
-    feps_err=feps_err,
-    fit_truncation_order=fit_truncation_order,
-    plot=plot,
-    title='f(ε) vs ε for the second fractal',
-    return_all_info=return_all_info,
+        epsilons,
+        feps,
+        feps_err=feps_err,
+        fit_truncation_order=fit_truncation_order,
+        plot=plot,
+        title='f(ε) vs ε for the second fractal',
+        return_all_info=return_all_info,
     )
 
 ##############################################################
@@ -1224,7 +1362,8 @@ def get_stroboscopic_trajectory_with_drift(
         plot=True,
         theta0 = None, v0 = None):
     """
-    Returns the 2pi Stroboscopic trajectory. Plotting is optional
+    Returns the 2pi Stroboscopic trajectory. Plotting is optional.
+    Only works for single divisor (small rates)
     """
 
     t_eval = np.arange(0, t_max, np.pi/divisor)
@@ -1286,10 +1425,21 @@ def solve_pendulum_with_drift_all_rates(rate, theta0, v0, f0, f_final, omega=1, 
     is small. 
     '''
 
-    if (0 <= rate <= large_rate_limit):
+    if (rate == 0):
+        times = np.arange(0, settling_time, np.pi/divisor)
+        thetas, vels, fs = solve_pendulum_with_drift(
+            t_eval=times, r=0, f0=f0, f_final=f0,
+            theta0=theta0, v0=v0, plot=False, omega=omega, nu=nu
+        )
+        return times, thetas, vels, fs
+    elif (0 < rate <= large_rate_limit):
         t_max = (f_final - f0)/rate + settling_time
-        return solve_pendulum_with_drift(t_eval=np.arange(0, t_max, np.pi/divisor), r = rate, f0 = f0, f_final = f_final, 
-                                                    theta0=theta0, v0=v0, plot=False, omega=omega, nu=nu)
+        times = np.arange(0, t_max, np.pi/divisor)
+        thetas, vels, fs = solve_pendulum_with_drift(
+            t_eval=times, r=rate, f0=f0, f_final=f_final,
+            theta0=theta0, v0=v0, plot=False, omega=omega, nu=nu
+        )
+        return times, thetas, vels, fs
     elif (rate > large_rate_limit):
         divisor1 = max(divisor, large_rate_multiple * rate)
 
@@ -1297,19 +1447,25 @@ def solve_pendulum_with_drift_all_rates(rate, theta0, v0, f0, f_final, omega=1, 
             drift_time_multiple = 1
                                   
         t_max = (f_final - f0)/rate * drift_time_multiple 
-        t_eval = np.arange(0, t_max, np.pi/divisor1)
-        thetas, vels, fs = solve_pendulum_with_drift(t_eval=t_eval, r = rate, f0 = f0, f_final = f_final, 
-                                                    theta0=theta0, v0=v0, plot=False, omega=omega, nu=nu)
+        times = np.arange(0, t_max, np.pi/divisor1)
+        thetas, vels, fs = solve_pendulum_with_drift(
+            t_eval=times, r=rate, f0=f0, f_final=f_final,
+            theta0=theta0, v0=v0, plot=False, omega=omega, nu=nu
+        )
         
-        thetas1, vels1, fs1 = solve_pendulum_with_drift(t_eval=np.arange(t_eval[-1], t_eval[-1]+settling_time, np.pi/divisor), 
-                                                    r = 0, f0 = fs[-1], f_final = fs[-1], theta0=thetas[-1], v0=vels[-1], plot=False, 
-                                                    omega=omega, nu=nu)
+        times1 = np.arange(times[-1], times[-1] + settling_time, np.pi/divisor)
+        thetas1, vels1, fs1 = solve_pendulum_with_drift(
+            t_eval=times1, r=0, f0=fs[-1], f_final=fs[-1],
+            theta0=thetas[-1], v0=vels[-1], plot=False,
+            omega=omega, nu=nu
+        )
 
+        times = np.concatenate((times, times1))
         thetas = np.concatenate((thetas, thetas1))
         vels = np.concatenate((vels, vels1))
         fs =  np.concatenate((fs, fs1))
 
-        return thetas, vels, fs
+        return times, thetas, vels, fs
     
     else:
         raise ValueError("Rate must be non-negative.")
@@ -1405,9 +1561,9 @@ def visualise_third_fractal(rate_min=0, rate_max=2, npts=1000,
     #     if fs_last is not None:
     #         print(f"rate={rate:.6g}, fs[-1]={fs_last:.17g}")
 
-    # split periodic / non-periodic
-    periodic_rates = [r for (r, is_per, _) in results if is_per]
-    non_periodic_rates = [r for (r, is_per, _) in results if not is_per]
+    periodic_mask = np.asarray([is_per for (_, is_per, _) in results], dtype=bool)
+    periodic_rates = rates[periodic_mask]
+    non_periodic_rates = rates[~periodic_mask]
 
     print(min(non_periodic_rates), max(periodic_rates))
 
@@ -1415,10 +1571,17 @@ def visualise_third_fractal(rate_min=0, rate_max=2, npts=1000,
 
     plt.figure(figsize=(fig_size[0], fig_size[1]), dpi = dpi)
 
-    if len(periodic_rates) > 0:
-        plt.hist(periodic_rates, bins=len(periodic_rates), color="blue", label="Tracking")
-    if len(non_periodic_rates) > 0:
-        plt.hist(non_periodic_rates, bins=len(non_periodic_rates), color="yellow", label="Escaping")
+    state_img = np.zeros((32, npts, 3), dtype=float)
+    state_img[:, periodic_mask] = [0.0, 0.0, 1.0]
+    state_img[:, ~periodic_mask] = [1.0, 1.0, 0.0]
+    plt.imshow(
+        state_img,
+        origin='lower',
+        extent=[rate_min, rate_max, 0, 1],
+        cmap=None,
+        aspect='auto',
+        interpolation='nearest'
+    )
 
     plt.ylim([0, 1])
     plt.xlabel("$r$", fontsize=font_size)
@@ -1434,46 +1597,74 @@ def visualise_third_fractal(rate_min=0, rate_max=2, npts=1000,
 # 3.
 ##############################################################
 
+def _rate_periodicity_worker(rate, theta0, v0, f0, f_final, omega, nu, tol, divisor,
+                             settling_time, large_rate_multiple, large_rate_limit):
+    """
+    Classify one rate as periodic/non-periodic using the adaptive drift solver.
+    """
+    _, thetas, _, _ = solve_pendulum_with_drift_all_rates(
+        rate=rate,
+        theta0=theta0,
+        v0=v0,
+        f0=f0,
+        f_final=f_final,
+        omega=omega,
+        nu=nu,
+        divisor=divisor,
+        settling_time=settling_time,
+        large_rate_multiple=large_rate_multiple,
+        large_rate_limit=large_rate_limit
+    )
+    return is_periodic_numba(
+        pi_fraction=divisor,
+        thetas=thetas,
+        omega=omega,
+        tolerance=tol
+    )
+
 def _uncertainty_for_eps_rate(eps, threshold, theta0, v0, f0, f_final, rate_min, rate_max,
-                         omega, nu, tol, divisor):
+                              omega, nu, tol, divisor, batch_size=2048, rng=None,
+                              max_trials=1_000_000, n_jobs=-1, settling_time=500,
+                              large_rate_multiple=1000, large_rate_limit=1,
+                              prefer='processes'):
     """
-    Worker to implement the uncertainty algorithm for the third fractal.
+    Batched worker for the uncertainty algorithm of the third fractal.
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     trials = 0
     uncertains = 0
+    sampled_pairs = 0
 
     while uncertains < threshold:
-        trials += 1
-        rate1 = np.random.uniform(rate_min, rate_max)
-        rate2 = rate1 + eps if rate1 + eps < rate_max else rate1 - eps
+        rate1s = rng.uniform(rate_min, rate_max, batch_size)
+        rate2s = np.where(rate1s + eps <= rate_max, rate1s + eps, rate1s - eps)
+        rate2s = np.clip(rate2s, rate_min, rate_max)
+        rates = np.concatenate((rate1s, rate2s))
 
-        thetas1, _, _ = solve_pendulum_with_drift_all_rates(
-            rate=rate1,
-            theta0=theta0,
-            v0=v0,
-            f0=f0,
-            f_final=f_final,
-            omega=omega,
-            nu=nu,
-            divisor=divisor
+        periodic_mask = np.asarray(
+            Parallel(n_jobs=n_jobs, prefer=prefer)(
+                delayed(_rate_periodicity_worker)(
+                    rate, theta0, v0, f0, f_final, omega, nu, tol, divisor,
+                    settling_time, large_rate_multiple, large_rate_limit
+                )
+                for rate in rates
+            ),
+            dtype=bool
         )
-        isperiodic1 = is_periodic_numba(pi_fraction=divisor, thetas = thetas1, omega = omega, tolerance=tol)
 
-        thetas2, _, _ = solve_pendulum_with_drift_all_rates(
-            rate=rate2,
-            theta0=theta0,
-            v0=v0,
-            f0=f0,
-            f_final=f_final,
-            omega=omega,
-            nu=nu,
-            divisor=divisor
+        pair_diffs = periodic_mask[:batch_size] != periodic_mask[batch_size:]
+        trials, uncertains = _update_uncertainty_counts(
+            trials, uncertains, pair_diffs, threshold
         )
-        isperiodic2 = is_periodic_numba(pi_fraction=divisor, thetas = thetas2, omega = omega, tolerance=tol)
 
-        if (isperiodic1 and not isperiodic2) or (not isperiodic1 and isperiodic2):
-            uncertains += 1
-            # print(uncertains)
+        sampled_pairs += batch_size
+        if sampled_pairs >= max_trials and uncertains == 0:
+            raise ValueError(
+                f'No uncertain points found after {sampled_pairs} sampled pairs at eps={eps:.3e}. '
+                'The sampled rate interval may lie inside a single basin at this scale.'
+            )
 
     p_hat = threshold / trials
     sigma_p = p_hat * np.sqrt(max(0.0, (1.0 - p_hat)) / threshold)
@@ -1482,51 +1673,67 @@ def _uncertainty_for_eps_rate(eps, threshold, theta0, v0, f0, f_final, rate_min,
 def uncertainty_algorithm_rate(theta0, v0, f0 = 0, f_final = 1.3, rate_min = 0, rate_max = 1,
     threshold=1000, plot=True, verbose=True, min_eps=1e-10, max_eps=1e-6, num_eps=20,
     return_all_info=False, f=1.2, omega=1, nu=0.1, tol=1e-3, n_jobs=-1, fit_truncation_order = 0,
-    divisor = 200, **kwargs):
+    divisor = 200, batch_size=2048, base_seed=0, max_trials=1_000_000,
+    settling_time=500, large_rate_multiple=1000, large_rate_limit=1,
+    prefer='processes', **kwargs):
 
     """
     Implement the uncertainty algorithm for the third fractal.
+    Uses batched rate samples and parallel adaptive drift solves.
     """
 
     epsilons = np.geomspace(min_eps, max_eps, num_eps)
-
-    # Choose iterator for outer loop (for nice progress display)
-    if verbose and n_jobs == 1:
-        iterator = tqdm(epsilons, desc="ε sweep")
-    else:
-        iterator = epsilons
-
     feps = []
     feps_err = []
-    trials_list = []
 
-    if n_jobs == 1:
-        # ---- Serial version (as before) ----
-        for eps in iterator:
-            p_hat, sigma_p, trials = _uncertainty_for_eps_rate(
-            eps, threshold, theta0, v0, f0, f_final, rate_min, rate_max, omega, nu, tol, divisor)
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
+    if verbose:
+        print(
+            f"Running third-fractal uncertainty algorithm with batch_size={batch_size} "
+            f"(n_jobs={n_jobs}, divisor={divisor})..."
+        )
+        iterator = tqdm(
+            enumerate(epsilons),
+            total=len(epsilons),
+            desc="fractal-3 eps sweep"
+        )
     else:
-        results = Parallel(n_jobs=n_jobs)(
-                delayed(_uncertainty_for_eps_rate)(eps, threshold, theta0, v0, f0, f_final, 
-                                                  rate_min, rate_max, omega, nu, tol, divisor)
-                for eps in epsilons)
+        iterator = enumerate(epsilons)
 
-        for p_hat, sigma_p, trials in results:
-            feps.append(p_hat)
-            feps_err.append(sigma_p)
-            trials_list.append(trials)
+    for i, eps in iterator:
+        rng = np.random.default_rng(base_seed + i)
+        p_hat, sigma_p, _ = _uncertainty_for_eps_rate(
+            eps=eps,
+            threshold=threshold,
+            theta0=theta0,
+            v0=v0,
+            f0=f0,
+            f_final=f_final,
+            rate_min=rate_min,
+            rate_max=rate_max,
+            omega=omega,
+            nu=nu,
+            tol=tol,
+            divisor=divisor,
+            batch_size=batch_size,
+            rng=rng,
+            max_trials=max_trials,
+            n_jobs=n_jobs,
+            settling_time=settling_time,
+            large_rate_multiple=large_rate_multiple,
+            large_rate_limit=large_rate_limit,
+            prefer=prefer
+        )
+        feps.append(p_hat)
+        feps_err.append(sigma_p)
 
     return loglog_linear_fit(
-    epsilons,
-    feps,
-    feps_err=feps_err,
-    fit_truncation_order=fit_truncation_order,
-    plot=plot,
-    title='f(ε) vs ε for the third fractal',
-    return_all_info=return_all_info,
+        epsilons,
+        feps,
+        feps_err=feps_err,
+        fit_truncation_order=fit_truncation_order,
+        plot=plot,
+        title='f(ε) vs ε for the third fractal',
+        return_all_info=return_all_info,
     )
 
 ##############################################################
@@ -1599,7 +1806,12 @@ def animate_pendulum(
     else:
         strobe_scatter = None
 
-    txt = ax.text(0.02, 0.95, "", transform=ax.transAxes)
+    txt = ax.text(
+        0.02, 0.98, "",
+        transform=ax.transAxes,
+        va='top',
+        ha='left'
+    )
 
     def init():
         rod.set_data([], [])
@@ -1655,7 +1867,7 @@ def animate_pendulum(
 ##############################################################    
 
 def animate_pendulum_with_drift(
-    theta0, v0, t_eval, f0, f_final, rate,
+    theta0, v0, f0, f_final, rate,
     L=1.0,
     fps=60,
     speed=1.0,
@@ -1670,7 +1882,7 @@ def animate_pendulum_with_drift(
     Animate the pendulum with drifting forcing (non-autonomous system)
     '''
 
-    thetas, _, fs = solve_pendulum_with_drift_all_rates(
+    times, thetas, _, fs = solve_pendulum_with_drift_all_rates(
         rate=rate,
         theta0=theta0,
         v0=v0,
@@ -1717,7 +1929,10 @@ def animate_pendulum_with_drift(
     else:
         strobe_scatter = None
 
-    txt = ax.text(0.02, 0.95, "", transform=ax.transAxes)
+    if (rate <= 1):
+        txt = ax.text(0.02, 0.95, "", transform=ax.transAxes)
+    else:
+        txt = ax.text(0.02, 0.9, "", transform=ax.transAxes)
 
     def init():
         rod.set_data([], [])
@@ -1749,7 +1964,9 @@ def animate_pendulum_with_drift(
             strobe_y.append(y[i])
             strobe_scatter.set_offsets(np.column_stack([strobe_x, strobe_y]))
 
-        txt.set_text(f"t = {t_eval[i]:.2f}; f = {fs[i]:.5f}")
+        txt.set_text(f"t = {times[i]:.2f}; f = {fs[i]:.5f}")
+        if (fs[i] < f_final and rate > 1):
+            txt.set_text(txt.get_text() + "\n (drifting...Finer dt due to large rate)")
 
         artists = [rod, bob, txt]
         if trail_line is not None:
